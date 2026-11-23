@@ -269,7 +269,7 @@ def _extract_score(comp_entry: dict[str, Any]) -> int | None:
 
 
 # ==============================================================================
-# 1. LỊCH THI ĐẤU & DANH SÁCH ĐỘI (SCOREBOARD & TEAMS)
+# 1. LỊCH THI ĐẤU & DANH SÁCH ĐỘI (SCOREBOARD CALENDAR + TEAM SCHEDULE)
 # ==============================================================================
 def _parse_scoreboard_events(data: dict[str, Any], league_code: str) -> list[dict[str, Any]]:
     league_info = LEAGUES[league_code]
@@ -358,44 +358,112 @@ def _parse_scoreboard_events(data: dict[str, Any], league_code: str) -> list[dic
 
 def get_upcoming_fixtures(
     league_code: str,
-    days_ahead: int = 21,
+    days_ahead: int = 60,
     days_back: int = 2,
 ) -> list[dict[str, Any]]:
     """
-    Lấy đầy đủ các trận sắp tới của UCL/UEL bằng cách gọi song song:
-      1) Scoreboard mặc định vòng hiện hành (không truyền dates)
-      2) Các cụm 3 ngày liên tiếp trong 15 ngày tới (tránh lỗi ESPN cắt dải ngày dài)
+    Lấy đầy đủ danh sách các trận sắp tới của UCL/UEL bằng 2 lớp tự động:
+      1) Đọc trực tiếp lịch ngày thi đấu chính thức (`calendar`) từ ESPN Scoreboard
+         và gọi song song từng ngày YYYYMMDD.
+      2) Nếu `calendar` chưa trả về trận sắp đá, lấy ngày đá kế tiếp từ lịch riêng
+         của 6 CLB đại diện trong giải rồi kéo toàn bộ cặp đấu các ngày đó.
     """
     slug = LEAGUES[league_code]["slug"]
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
     now_utc = datetime.now(timezone.utc)
-
-    date_windows: list[str | None] = [None]
-    span = max(days_ahead, 15)
-    for offset in range(-days_back, span, 3):
-        s_str = (now_utc + timedelta(days=offset)).strftime("%Y%m%d")
-        e_str = (now_utc + timedelta(days=offset + 2)).strftime("%Y%m%d")
-        date_windows.append(f"{s_str}-{e_str}")
+    min_dt = now_utc - timedelta(days=days_back)
+    max_dt = now_utc + timedelta(days=max(days_ahead, 60))
 
     merged: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = [
-            pool.submit(
-                _http_get_json,
-                url,
-                {"dates": dw, "limit": 100} if dw else {"limit": 100},
+    base_data = _http_get_json(url, params={"limit": 100})
+    for fx in _parse_scoreboard_events(base_data, league_code):
+        merged[fx["event_id"]] = fx
+
+    # Lớp 1: Trích các ngày thi đấu chính thức từ trường `calendar` của ESPN
+    target_dates: list[str] = []
+    for lg_obj in base_data.get("leagues", []) or []:
+        for cal_item in lg_obj.get("calendar", []) or []:
+            cal_str = (
+                cal_item
+                if isinstance(cal_item, str)
+                else str((cal_item or {}).get("startDate") or (cal_item or {}).get("value") or "")
             )
-            for dw in date_windows
-        ]
-        try:
-            for fut in as_completed(futs, timeout=9):
+            dt_cal = parse_iso_to_vn(cal_str)
+            if dt_cal:
+                dt_cal_utc = dt_cal.astimezone(timezone.utc)
+                if min_dt <= dt_cal_utc <= max_dt:
+                    d_key = dt_cal_utc.strftime("%Y%m%d")
+                    if d_key not in target_dates:
+                        target_dates.append(d_key)
+
+    target_dates.sort()
+    if target_dates:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [
+                pool.submit(_http_get_json, url, {"dates": d_key, "limit": 100})
+                for d_key in target_dates[:8]
+            ]
+            try:
+                for fut in as_completed(futs, timeout=9):
+                    try:
+                        for fx in _parse_scoreboard_events(fut.result(), league_code):
+                            merged[fx["event_id"]] = fx
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    # Lớp 2: Nếu chưa có trận sắp đá (pre/in), dò ngày thi đấu từ lịch riêng 6 CLB trong giải
+    has_upcoming = any(f["status_state"] in ("pre", "in") for f in merged.values())
+    if not has_upcoming:
+        teams = get_league_teams(league_code)
+        if teams:
+            step = max(1, len(teams) // 6)
+            sample_teams = teams[::step][:6]
+            target_kw = "champions league" if league_code == "UCL" else "europa league"
+            discovered_dates: set[str] = set()
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                futs = [
+                    pool.submit(get_team_all_comp_schedule, t["id"], SEASON_YEAR, True)
+                    for t in sample_teams
+                ]
                 try:
-                    for fx in _parse_scoreboard_events(fut.result(), league_code):
-                        merged[fx["event_id"]] = fx
+                    for fut in as_completed(futs, timeout=9):
+                        try:
+                            for m in fut.result():
+                                is_this_comp = (
+                                    m.get("league_slug") == slug
+                                    or target_kw in m.get("league_name", "").lower()
+                                )
+                                if not is_this_comp:
+                                    continue
+                                if m["state"] in ("pre", "in") and m.get("dt_vn"):
+                                    d_utc = m["dt_vn"].astimezone(timezone.utc).strftime("%Y%m%d")
+                                    discovered_dates.add(d_utc)
+                                    # Thêm luôn trận tìm thấy từ lịch CLB làm phương án dự phòng
+                                    if m["event_id"] not in merged:
+                                        merged[m["event_id"]] = _build_light_fixture(m, league_code)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
-        except Exception:
-            pass
+
+            if discovered_dates:
+                with ThreadPoolExecutor(max_workers=6) as pool:
+                    futs = [
+                        pool.submit(_http_get_json, url, {"dates": d_key, "limit": 100})
+                        for d_key in sorted(discovered_dates)[:6]
+                    ]
+                    try:
+                        for fut in as_completed(futs, timeout=8):
+                            try:
+                                for fx in _parse_scoreboard_events(fut.result(), league_code):
+                                    merged[fx["event_id"]] = fx
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
     fixtures = list(merged.values())
     fixtures.sort(key=lambda x: x["date_utc"] or "9999")
@@ -448,8 +516,7 @@ def get_league_teams(league_code: str) -> list[dict[str, str]]:
     return sorted(teams_map.values(), key=lambda x: x["name"])
 
 
-def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, Any]:
-    """Chuyển đổi bản ghi lịch đội bóng thành chuẩn fixture của Web App & Telegram Bot."""
+def _build_light_fixture(m: dict[str, Any], league_code: str) -> dict[str, Any]:
     league_info = LEAGUES[league_code]
     dt_vn = m.get("dt_vn") or parse_iso_to_vn(m.get("date_utc", ""))
     time_label = dt_vn.strftime("%d/%m %H:%M") if dt_vn else "TBD"
@@ -461,15 +528,6 @@ def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, 
         if state in ("in", "post") and h_score is not None and a_score is not None
         else ""
     )
-
-    if dt_vn:
-        day_str = dt_vn.astimezone(timezone.utc).strftime("%Y%m%d")
-        sb_url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_info['slug']}/scoreboard"
-        sb_data = _http_get_json(sb_url, params={"dates": day_str, "limit": 50})
-        for fx in _parse_scoreboard_events(sb_data, league_code):
-            if fx["event_id"] == m["event_id"]:
-                return fx
-
     return {
         "event_id": m["event_id"],
         "league_code": league_code,
@@ -498,13 +556,27 @@ def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, 
     }
 
 
+def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, Any]:
+    """Chuyển đổi bản ghi lịch đội bóng thành chuẩn fixture đầy đủ thông tin sân bãi."""
+    league_info = LEAGUES[league_code]
+    dt_vn = m.get("dt_vn") or parse_iso_to_vn(m.get("date_utc", ""))
+    if dt_vn:
+        day_str = dt_vn.astimezone(timezone.utc).strftime("%Y%m%d")
+        sb_url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_info['slug']}/scoreboard"
+        sb_data = _http_get_json(sb_url, params={"dates": day_str, "limit": 50})
+        for fx in _parse_scoreboard_events(sb_data, league_code):
+            if fx["event_id"] == m["event_id"]:
+                return fx
+    return _build_light_fixture(m, league_code)
+
+
 def find_team_next_match(
     query_text: str,
     preferred_league: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Tìm trận đấu sắp tới (ưu tiên chưa đá/đang đá) của 1 đội bóng trên UCL/UEL:
-      1) Quét trực tiếp các trận sắp tới trên Scoreboard UCL/UEL
+      1) Quét trực tiếp các trận sắp tới từ get_upcoming_fixtures
       2) Tra team_id và kéo lịch riêng của đội (kèm ?fixture=true)
     """
     resolved = resolve_team_alias(query_text)
@@ -531,11 +603,11 @@ def find_team_next_match(
                 best = max(best, 75)
         return best
 
-    # 1. Tìm ngay trong danh sách trận sắp đá (pre/in) của UCL & UEL
+    # 1. Tìm trong danh sách trận sắp đá (pre/in) của UCL & UEL
     upcoming_all: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futs = [pool.submit(get_upcoming_fixtures, lg, 21, 1) for lg in target_leagues]
-        for fut in as_completed(futs, timeout=10):
+        futs = [pool.submit(get_upcoming_fixtures, lg, 60, 1) for lg in target_leagues]
+        for fut in as_completed(futs, timeout=12):
             try:
                 upcoming_all.extend(fut.result())
             except Exception:
@@ -556,7 +628,7 @@ def find_team_next_match(
         upcoming_hits.sort(key=lambda x: (-x[0], x[1]["date_utc"] or "9999"))
         return upcoming_hits[0][1]
 
-    # 2. Tra ID đội trong 36 đội và kéo lịch đội bóng (gồm cả ?fixture=true)
+    # 2. Tra ID đội trong danh sách giải và kéo lịch riêng (gồm cả ?fixture=true)
     teams_by_league: dict[str, list[dict[str, str]]] = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         futs = {pool.submit(get_league_teams, lg): lg for lg in target_leagues}
@@ -634,10 +706,7 @@ def _extract_standings_entries(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def get_league_standings(league_code: str) -> dict[str, Any]:
-    """
-    Lấy bảng xếp hạng League Phase 36 đội từ ESPN Standings
-    (gọi song song cả nhánh apis/v2 chuẩn cho bóng đá UEFA và apis/site/v2 dự phòng).
-    """
+    """Lấy bảng xếp hạng League Phase 36 đội từ ESPN Standings."""
     slug = LEAGUES[league_code]["slug"]
     endpoints = [
         (f"https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings", None),
@@ -1062,10 +1131,11 @@ def get_team_all_comp_schedule(
 
     merged: dict[str, dict[str, Any]] = {}
     if include_fixtures:
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
             f_past = pool.submit(_http_get_json, url, {"season": season})
             f_next = pool.submit(_http_get_json, url, {"season": season, "fixture": "true"})
-            for fut in (f_past, f_next):
+            f_curr = pool.submit(_http_get_json, url, {"fixture": "true"})
+            for fut in (f_past, f_next, f_curr):
                 try:
                     for item in _parse_schedule_events(fut.result(timeout=8), team_id):
                         merged[item["event_id"]] = item
