@@ -131,7 +131,6 @@ with st.sidebar:
         if not fixtures:
             st.warning("Hiện chưa có lịch thi đấu sắp tới trên ESPN cho giải này.")
         else:
-            # Ưu tiên đưa trận chưa đá / đang đá lên trước
             ordered_fx = [f for f in fixtures if f["status_state"] in ("pre", "in")] + [
                 f for f in fixtures if f["status_state"] == "post"
             ]
@@ -153,10 +152,16 @@ with st.sidebar:
         if chosen_team:
             selected_fixture = find_team_next_match(chosen_team, preferred_league=league_code)
             if selected_fixture:
-                st.info(
-                    f"Trận kế tiếp: **{selected_fixture['home_name']} vs "
-                    f"{selected_fixture['away_name']}**\n\n🕒 {selected_fixture['kickoff_vn']}"
-                )
+                if selected_fixture["status_state"] in ("pre", "in"):
+                    st.info(
+                        f"🟢 **Trận sắp tới:** {selected_fixture['home_name']} vs "
+                        f"{selected_fixture['away_name']}\n\n🕒 {selected_fixture['kickoff_vn']}"
+                    )
+                else:
+                    st.warning(
+                        f"🟡 **Trận vừa đá gần nhất:** {selected_fixture['home_name']} vs "
+                        f"{selected_fixture['away_name']}\n\n🕒 {selected_fixture['kickoff_vn']}"
+                    )
             else:
                 st.warning(f"Chưa tìm thấy trận đấu nào gần đây của {chosen_team} tại {league_code}.")
 
@@ -247,7 +252,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 # TAB 1: NHÂN SỰ, PHÁP LÝ UEFA & ĐỘI HÌNH T-75
 # ------------------------------------------------------------------------------
 with tab1:
-    st.subheader("Đội hình ra sân chính thức (T-75 trước giờ bóng lăn)")
+    if fx["status_state"] == "post":
+        st.subheader("Đội hình ra sân chính thức (Trận đã diễn ra)")
+    else:
+        st.subheader("Đội hình ra sân chính thức (T-75 trước giờ bóng lăn)")
     c_h, c_a = st.columns(2)
 
     for col, side_key, team_title in ((c_h, "home", home_name), (c_a, "away", away_name)):
