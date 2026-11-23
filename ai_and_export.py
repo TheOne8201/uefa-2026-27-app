@@ -2,7 +2,7 @@
 """
 UEFA 2026/2027 AI Summarizer, Word (.docx) Exporter & Telegram Formatter/Sender
 SDK: google-genai (>=1.0.0), NO Google Search Grounding.
-Fallback chain: gemini-2.5-flash -> gemini-2.5-flash-lite -> gemini-flash-latest -> gemini-2.0-flash -> Raw RSS.
+Auto-discovers active Gemini Flash models on user's API key -> Raw RSS Fallback.
 Zero hardcoded secrets.
 """
 
@@ -24,13 +24,12 @@ from google import genai
 from google.genai import types
 
 # ==============================================================================
-# CẤU HÌNH GEMINI API CHUẨN (CHỐNG 404 & CHỐNG CẮT TIMEOUT SỚM)
+# CẤU HÌNH GEMINI API CHUẨN (TỰ ĐỘNG DÒ MODEL KHẢ DỤNG + CHỐNG TIMEOUT SỚM)
 # ==============================================================================
-MODEL_FALLBACK_CHAIN = [
+DEFAULT_FALLBACK_MODELS = [
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-flash-latest",
-    "gemini-2.0-flash",
+    "gemini-3-flash-preview",
+    "gemini-2.5-pro",
 ]
 MODEL_TIMEOUT_SECONDS = 25
 TELEGRAM_HTTP_TIMEOUT = (4, 7)
@@ -42,8 +41,61 @@ def _clean_rss_text(raw: str) -> str:
     return re.sub(r"\s+", " ", unescaped).strip()
 
 
+def _discover_active_gemini_models(api_key: str) -> list[str]:
+    """
+    Hỏi trực tiếp API Google danh sách model đang mở trên GEMINI_API_KEY của người dùng
+    để tránh tuyệt đối lỗi 404 do đổi tên phiên bản.
+    """
+    excluded_keywords = (
+        "embedding",
+        "imagen",
+        "veo",
+        "aqa",
+        "tts",
+        "audio",
+        "robotics",
+        "computer-use",
+        "deep-research",
+    )
+    try:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=10000),
+        )
+        flash_models: list[str] = []
+        other_models: list[str] = []
+
+        for m in client.models.list():
+            raw_name = (getattr(m, "name", None) or "").strip()
+            if not raw_name:
+                continue
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+
+            short_name = raw_name.removeprefix("models/")
+            low = short_name.lower()
+            if "gemini" not in low:
+                continue
+            if any(bad in low for bad in excluded_keywords):
+                continue
+
+            if "flash" in low:
+                flash_models.append(short_name)
+            else:
+                other_models.append(short_name)
+
+        # Ưu tiên bản mới nhất (sắp xếp giảm dần theo tên phiên bản)
+        flash_models.sort(reverse=True)
+        other_models.sort(reverse=True)
+        combined = flash_models + other_models
+        return combined[:5] if combined else list(DEFAULT_FALLBACK_MODELS)
+    except Exception:
+        return list(DEFAULT_FALLBACK_MODELS)
+
+
 def _format_raw_rss_fallback(articles: list[dict[str, Any]], reason: str) -> dict[str, Any]:
-    """Hiển thị danh sách tin RSS gốc khi Gemini gặp 429, hết lượt hoặc không có API Key."""
+    """Hiển thị danh sách tin RSS gốc khi Gemini gặp 429, hết lượt hoặc lỗi kết nối."""
     if not articles:
         body = (
             "Chưa ghi nhận bài báo mới trong các nguồn RSS uy tín (UEFA, BBC, Sky, Guardian, "
@@ -147,11 +199,14 @@ DANH SÁCH BÀI BÁO RSS UY TÍN:
 {rss_context}
 """
 
+    clean_key = api_key.strip()
+    candidate_models = _discover_active_gemini_models(clean_key)
+
     last_error = ""
-    for model_name in MODEL_FALLBACK_CHAIN:
+    for model_name in candidate_models:
         executor = ThreadPoolExecutor(max_workers=1)
         try:
-            future = executor.submit(_call_single_gemini_model, api_key.strip(), model_name, prompt)
+            future = executor.submit(_call_single_gemini_model, clean_key, model_name, prompt)
             ai_text = future.result(timeout=MODEL_TIMEOUT_SECONDS)
             executor.shutdown(wait=False)
             return {
@@ -170,6 +225,10 @@ DANH SÁCH BÀI BÁO RSS UY TÍN:
                 last_error = f"{model_name} giới hạn lượt (429)"
             elif "404" in err_msg:
                 last_error = f"{model_name} không khả dụng (404)"
+            elif "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg:
+                last_error = "GEMINI_API_KEY chưa hợp lệ"
+                executor.shutdown(wait=False)
+                break
             else:
                 last_error = f"{model_name} lỗi: {err_msg[:90]}"
             executor.shutdown(wait=False)
