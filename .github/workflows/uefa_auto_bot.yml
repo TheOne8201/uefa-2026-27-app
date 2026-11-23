@@ -1,0 +1,66 @@
+name: UEFA 2026-27 Auto Bot & 2-Way Telegram
+
+on:
+  # 1. Nhận lệnh 2 chiều tức thì từ Cloudflare Worker (uefa-2026-telegram)
+  repository_dispatch:
+    types: [uefa_telegram_command]
+
+  # 2. Chạy tự động đêm Cúp châu Âu: Thứ 3, Thứ 4, Thứ 5 (UTC) khung 15:00-21:45 UTC
+  # (tương ứng 22:00 đến 04:45 rạng sáng Thứ 4, Thứ 5, Thứ 6 theo giờ VN GMT+7)
+  schedule:
+    - cron: "*/15 15-21 * * 2,3,4"
+
+  # 3. Cho phép bấm chạy kiểm tra thủ công ngay trên GitHub Actions
+  workflow_dispatch:
+    inputs:
+      test_command:
+        description: "Để trống để chạy quét tự động, hoặc nhập thử VD: /match Real"
+        required: false
+        default: ""
+
+jobs:
+  run-uefa-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore anti-spam state (auto_scan only)
+        if: github.event_name != 'repository_dispatch' && inputs.test_command == ''
+        uses: actions/cache/restore@v4
+        with:
+          path: uefa_sent_state.json
+          key: uefa-bot-state-${{ github.run_id }}
+          restore-keys: |
+            uefa-bot-state-
+
+      - name: Run UEFA Telegram Bot Runner
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCHLIST_TEAMS: ${{ secrets.WATCHLIST_TEAMS }}
+          BOT_MODE: ${{ (github.event_name == 'repository_dispatch' || inputs.test_command != '') && 'command' || 'auto_scan' }}
+          CMD_TEXT: ${{ github.event.client_payload.command || inputs.test_command || '' }}
+          CMD_CHAT_ID: ${{ github.event.client_payload.chat_id || '' }}
+        run: python telegram_bot_runner.py
+
+      - name: Save anti-spam state (auto_scan only)
+        if: github.event_name != 'repository_dispatch' && inputs.test_command == ''
+        uses: actions/cache/save@v4
+        with:
+          path: uefa_sent_state.json
+          key: uefa-bot-state-${{ github.run_id }}
