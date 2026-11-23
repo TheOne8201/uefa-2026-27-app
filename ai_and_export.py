@@ -2,7 +2,7 @@
 """
 UEFA 2026/2027 AI Summarizer, Word (.docx) Exporter & Telegram Formatter/Sender
 SDK: google-genai (>=1.0.0), NO Google Search Grounding.
-Fallback chain: gemini-3.8-flash -> gemini-3.6-flash -> gemini-3-flash-preview -> Raw RSS.
+Fallback chain: gemini-2.5-flash -> gemini-2.5-flash-lite -> gemini-flash-latest -> gemini-2.0-flash -> Raw RSS.
 Zero hardcoded secrets.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html
 import io
+import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from typing import Any
 
@@ -26,12 +27,19 @@ from google.genai import types
 # CẤU HÌNH GEMINI API CHUẨN (CHỐNG 404 & CHỐNG CẮT TIMEOUT SỚM)
 # ==============================================================================
 MODEL_FALLBACK_CHAIN = [
-    "gemini-3.8-flash",
-    "gemini-3.6-flash",
-    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-2.0-flash",
 ]
 MODEL_TIMEOUT_SECONDS = 25
 TELEGRAM_HTTP_TIMEOUT = (4, 7)
+
+
+def _clean_rss_text(raw: str) -> str:
+    """Giải mã ký tự HTML (&nbsp;, &amp;...) và chuẩn hóa khoảng trắng."""
+    unescaped = html.unescape(raw or "").replace("\xa0", " ")
+    return re.sub(r"\s+", " ", unescaped).strip()
 
 
 def _format_raw_rss_fallback(articles: list[dict[str, Any]], reason: str) -> dict[str, Any]:
@@ -44,9 +52,11 @@ def _format_raw_rss_fallback(articles: list[dict[str, Any]], reason: str) -> dic
     else:
         lines = [f"*(Đang hiển thị danh sách tin RSS gốc — lý do: {reason})*\n"]
         for i, art in enumerate(articles, start=1):
+            clean_title = _clean_rss_text(art.get("title", ""))
+            clean_snip = _clean_rss_text(art.get("snippet", ""))
             lines.append(
-                f"{i}. **[{art['source']} - {art['published_str']}]** {art['title']}\n"
-                f"   - Tóm lược: {art['snippet'] or 'Không có đoạn trích.'}\n"
+                f"{i}. **[{art['source']} - {art['published_str']}]** {clean_title}\n"
+                f"   - Tóm lược: {clean_snip or 'Không có đoạn trích.'}\n"
                 f"   - Link: {art['link']}"
             )
         body = "\n".join(lines)
@@ -110,10 +120,11 @@ def summarize_uefa_rss_with_ai(
 
     rss_block_lines = []
     for idx, art in enumerate(trimmed_articles, start=1):
-        snippet = (art.get("snippet") or "")[:180]
+        clean_title = _clean_rss_text(art.get("title", ""))
+        snippet = _clean_rss_text(art.get("snippet", ""))[:180]
         rss_block_lines.append(
             f"[{idx}] Nguồn: {art['source']} | Ngày đăng: {art['published_str']} | "
-            f"Tiêu đề: {art['title']} | Đoạn trích: {snippet}"
+            f"Tiêu đề: {clean_title} | Đoạn trích: {snippet}"
         )
     rss_context = "\n".join(rss_block_lines)
 
@@ -439,7 +450,6 @@ def send_telegram_message(
         try:
             resp = requests.post(url, json=payload, timeout=TELEGRAM_HTTP_TIMEOUT)
             if resp.status_code != 200:
-                # Nếu lỗi định dạng HTML, thử gửi lại dạng văn bản thuần
                 if parse_mode == "HTML":
                     payload.pop("parse_mode", None)
                     resp2 = requests.post(url, json=payload, timeout=TELEGRAM_HTTP_TIMEOUT)
