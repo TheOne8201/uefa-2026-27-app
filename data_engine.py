@@ -24,7 +24,7 @@ from requests.adapters import HTTPAdapter
 # ==============================================================================
 VN_TZ = timezone(timedelta(hours=7))
 SEASON_YEAR = 2026
-HTTP_TIMEOUT = (4, 7)  # (connect_timeout, read_timeout) cứng cho mọi request
+HTTP_TIMEOUT = (4, 7)
 
 LEAGUES: dict[str, dict[str, str]] = {
     "UCL": {
@@ -53,7 +53,6 @@ TRUSTED_RSS_DOMAINS = [
     "gazzetta.it",
 ]
 
-# Từ điển biệt danh phổ biến cho các CLB UCL & UEL
 TEAM_ALIASES: dict[str, str] = {
     "real": "real madrid",
     "rm": "real madrid",
@@ -362,23 +361,44 @@ def get_upcoming_fixtures(
     days_ahead: int = 21,
     days_back: int = 2,
 ) -> list[dict[str, Any]]:
-    """Lấy danh sách các trận đấu sắp tới (và vừa diễn ra gần nhất) của UCL hoặc UEL."""
+    """
+    Lấy đầy đủ các trận sắp tới của UCL/UEL bằng cách gọi song song:
+      1) Scoreboard mặc định vòng hiện hành (không truyền dates)
+      2) Các cụm 3 ngày liên tiếp trong 15 ngày tới (tránh lỗi ESPN cắt dải ngày dài)
+    """
     slug = LEAGUES[league_code]["slug"]
-    now_utc = datetime.now(timezone.utc)
-    start_str = (now_utc - timedelta(days=days_back)).strftime("%Y%m%d")
-    end_str = (now_utc + timedelta(days=days_ahead)).strftime("%Y%m%d")
-
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard"
-    data = _http_get_json(url, params={"dates": f"{start_str}-{end_str}", "limit": 100})
-    fixtures = _parse_scoreboard_events(data, league_code)
+    now_utc = datetime.now(timezone.utc)
 
-    # Nếu đang kỳ nghỉ giữa 2 lượt đấu châu Âu (trống trong 21 ngày), tự động mở rộng 50 ngày
-    upcoming = [f for f in fixtures if f["status_state"] in ("pre", "in")]
-    if not upcoming and days_ahead < 50:
-        ext_end = (now_utc + timedelta(days=50)).strftime("%Y%m%d")
-        data_ext = _http_get_json(url, params={"dates": f"{start_str}-{ext_end}", "limit": 100})
-        fixtures = _parse_scoreboard_events(data_ext, league_code)
+    date_windows: list[str | None] = [None]
+    span = max(days_ahead, 15)
+    for offset in range(-days_back, span, 3):
+        s_str = (now_utc + timedelta(days=offset)).strftime("%Y%m%d")
+        e_str = (now_utc + timedelta(days=offset + 2)).strftime("%Y%m%d")
+        date_windows.append(f"{s_str}-{e_str}")
 
+    merged: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = [
+            pool.submit(
+                _http_get_json,
+                url,
+                {"dates": dw, "limit": 100} if dw else {"limit": 100},
+            )
+            for dw in date_windows
+        ]
+        try:
+            for fut in as_completed(futs, timeout=9):
+                try:
+                    for fx in _parse_scoreboard_events(fut.result(), league_code):
+                        merged[fx["event_id"]] = fx
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    fixtures = list(merged.values())
+    fixtures.sort(key=lambda x: x["date_utc"] or "9999")
     return fixtures
 
 
@@ -414,7 +434,6 @@ def get_league_teams(league_code: str) -> list[dict[str, str]]:
                         "abbr": str(t.get("abbreviation", "")),
                     }
 
-    # Bổ sung từ bảng xếp hạng nếu endpoint teams thiếu
     if len(teams_map) < 20:
         standings = get_league_standings(league_code)
         for row in standings.get("table", []):
@@ -443,9 +462,6 @@ def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, 
         else ""
     )
 
-    # Thử lấy thêm thông tin sân vận động & vòng đấu từ scoreboard đúng ngày diễn ra trận
-    venue_str = "Sân CLB chủ nhà"
-    round_name = league_info["short"]
     if dt_vn:
         day_str = dt_vn.astimezone(timezone.utc).strftime("%Y%m%d")
         sb_url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_info['slug']}/scoreboard"
@@ -464,8 +480,8 @@ def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, 
         "kickoff_dt_vn": dt_vn,
         "status_state": state,
         "status_detail": state.upper(),
-        "round_name": round_name,
-        "venue": venue_str,
+        "round_name": league_info["short"],
+        "venue": "Sân CLB chủ nhà",
         "home_id": m.get("home_id", ""),
         "home_name": m.get("home_name", ""),
         "home_abbr": "",
@@ -487,8 +503,9 @@ def find_team_next_match(
     preferred_league: str | None = None,
 ) -> dict[str, Any] | None:
     """
-    Tìm trận đấu sắp tới (ưu tiên chưa đá/đang đá, nếu không có thì lấy trận gần nhất)
-    của 1 đội bóng bằng cách tra ID đội trong 36 đội UCL/UEL rồi lấy lịch riêng của đội đó.
+    Tìm trận đấu sắp tới (ưu tiên chưa đá/đang đá) của 1 đội bóng trên UCL/UEL:
+      1) Quét trực tiếp các trận sắp tới trên Scoreboard UCL/UEL
+      2) Tra team_id và kéo lịch riêng của đội (kèm ?fixture=true)
     """
     resolved = resolve_team_alias(query_text)
     raw_norm = normalize_text(query_text)
@@ -497,7 +514,49 @@ def find_team_next_match(
 
     target_leagues = [preferred_league] if preferred_league in LEAGUES else ["UCL", "UEL"]
 
-    # 1. Lấy danh sách đội của UCL & UEL song song để tìm chính xác team_id
+    def _match_team_name(name_str: str, abbr_str: str = "") -> int:
+        tn = normalize_text(name_str)
+        ta = normalize_text(abbr_str)
+        best = 0
+        for q in (resolved, raw_norm):
+            if not q:
+                continue
+            if q == tn:
+                best = max(best, 100)
+            elif q in tn:
+                best = max(best, 90)
+            elif ta and q == ta:
+                best = max(best, 80)
+            elif len(q.split()) >= 1 and all(tok in tn for tok in q.split()):
+                best = max(best, 75)
+        return best
+
+    # 1. Tìm ngay trong danh sách trận sắp đá (pre/in) của UCL & UEL
+    upcoming_all: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(get_upcoming_fixtures, lg, 21, 1) for lg in target_leagues]
+        for fut in as_completed(futs, timeout=10):
+            try:
+                upcoming_all.extend(fut.result())
+            except Exception:
+                pass
+
+    upcoming_hits: list[tuple[int, dict[str, Any]]] = []
+    for fx in upcoming_all:
+        if fx["status_state"] not in ("pre", "in"):
+            continue
+        sc = max(
+            _match_team_name(fx["home_name"], fx.get("home_abbr", "")),
+            _match_team_name(fx["away_name"], fx.get("away_abbr", "")),
+        )
+        if sc > 0:
+            upcoming_hits.append((sc, fx))
+
+    if upcoming_hits:
+        upcoming_hits.sort(key=lambda x: (-x[0], x[1]["date_utc"] or "9999"))
+        return upcoming_hits[0][1]
+
+    # 2. Tra ID đội trong 36 đội và kéo lịch đội bóng (gồm cả ?fixture=true)
     teams_by_league: dict[str, list[dict[str, str]]] = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         futs = {pool.submit(get_league_teams, lg): lg for lg in target_leagues}
@@ -508,43 +567,20 @@ def find_team_next_match(
             except Exception:
                 teams_by_league[lg] = []
 
-    def _score_team(team_obj: dict[str, str]) -> int:
-        tn = normalize_text(team_obj.get("name", ""))
-        ta = normalize_text(team_obj.get("abbr", ""))
-        best = 0
-        if resolved:
-            if resolved == tn:
-                best = max(best, 100)
-            elif resolved in tn:
-                best = max(best, 90)
-            elif resolved == ta:
-                best = max(best, 80)
-            elif all(tok in tn for tok in resolved.split()):
-                best = max(best, 75)
-        if raw_norm:
-            if raw_norm == tn:
-                best = max(best, 95)
-            elif raw_norm in tn:
-                best = max(best, 82)
-            elif raw_norm == ta:
-                best = max(best, 78)
-        return best
-
     matched_teams: list[tuple[int, str, dict[str, str]]] = []
     for lg, t_list in teams_by_league.items():
         for t in t_list:
-            sc = _score_team(t)
+            sc = _match_team_name(t.get("name", ""), t.get("abbr", ""))
             if sc > 0:
                 matched_teams.append((sc, lg, t))
 
     matched_teams.sort(key=lambda x: -x[0])
 
-    # 2. Kéo lịch thi đấu riêng của đội khớp nhất & lọc đúng giải UCL/UEL
     for _, lg, team_obj in matched_teams[:2]:
         team_id = team_obj["id"]
         target_slug = LEAGUES[lg]["slug"]
         target_kw = "champions league" if lg == "UCL" else "europa league"
-        sched = get_team_all_comp_schedule(team_id, SEASON_YEAR)
+        sched = get_team_all_comp_schedule(team_id, SEASON_YEAR, include_fixtures=True)
 
         uefa_matches = [
             m
@@ -565,24 +601,6 @@ def find_team_next_match(
             completed.sort(key=lambda x: x["date_utc"] or "", reverse=True)
             return _schedule_item_to_fixture(completed[0], lg)
 
-    # 3. Dự phòng cuối cùng: quét scoreboard gần hiện tại nếu đội không nằm trong danh sách teams
-    fallback_fixtures: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        futs = [pool.submit(get_upcoming_fixtures, lg, 21, 7) for lg in target_leagues]
-        for fut in as_completed(futs, timeout=10):
-            try:
-                fallback_fixtures.extend(fut.result())
-            except Exception:
-                pass
-
-    for fx in fallback_fixtures:
-        hn = normalize_text(fx["home_name"])
-        an = normalize_text(fx["away_name"])
-        if (resolved and (resolved in hn or resolved in an)) or (
-            raw_norm and (raw_norm in hn or raw_norm in an)
-        ):
-            return fx
-
     return None
 
 
@@ -599,23 +617,47 @@ def _classify_uefa_zone(rank: int) -> str:
     return "Chưa phân vùng"
 
 
-def get_league_standings(league_code: str) -> dict[str, Any]:
-    """Lấy bảng xếp hạng League Phase 36 đội từ ESPN Standings."""
-    slug = LEAGUES[league_code]["slug"]
-    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/standings"
-    data = _http_get_json(url, params={"season": SEASON_YEAR})
-    if not data or not (data.get("children") or data.get("standings")):
-        data = _http_get_json(url)
-
+def _extract_standings_entries(data: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
+    if not isinstance(data, dict):
+        return entries
+
     if data.get("children"):
         for child in data["children"]:
             st = child.get("standings", {}) or {}
             child_entries = st.get("entries", []) or []
             if len(child_entries) > len(entries):
                 entries = child_entries
-    elif data.get("standings"):
+    if not entries and data.get("standings"):
         entries = (data.get("standings", {}) or {}).get("entries", []) or []
+    return entries
+
+
+def get_league_standings(league_code: str) -> dict[str, Any]:
+    """
+    Lấy bảng xếp hạng League Phase 36 đội từ ESPN Standings
+    (gọi song song cả nhánh apis/v2 chuẩn cho bóng đá UEFA và apis/site/v2 dự phòng).
+    """
+    slug = LEAGUES[league_code]["slug"]
+    endpoints = [
+        (f"https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings", None),
+        (f"https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings", {"season": SEASON_YEAR}),
+        (f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/standings", None),
+    ]
+
+    entries: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futs = [pool.submit(_http_get_json, u, p) for u, p in endpoints]
+        try:
+            for fut in as_completed(futs, timeout=8):
+                try:
+                    cand = _extract_standings_entries(fut.result())
+                    if len(cand) > len(entries):
+                        entries = cand
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     rows: list[dict[str, Any]] = []
     for idx, entry in enumerate(entries, start=1):
@@ -626,7 +668,8 @@ def get_league_standings(league_code: str) -> dict[str, Any]:
             name = st.get("name") or st.get("abbreviation") or ""
             stat_map[name] = st.get("value", st.get("displayValue"))
 
-        rank = _safe_int(stat_map.get("rank"), idx)
+        note_rank = (entry.get("note", {}) or {}).get("rank")
+        rank = _safe_int(stat_map.get("rank") or note_rank, idx)
         played = _safe_int(stat_map.get("gamesPlayed"), 0)
         wins = _safe_int(stat_map.get("wins"), 0)
         draws = _safe_int(stat_map.get("ties"), 0)
@@ -935,15 +978,7 @@ def extract_injuries_filtered(
 # ==============================================================================
 # 4. LỊCH ĐA GIẢI "BÁNH MÌ KẸP", PHONG ĐỘ & VÁ LỖI H2H 4 MÙA
 # ==============================================================================
-def get_team_all_comp_schedule(team_id: str, season: int = SEASON_YEAR) -> list[dict[str, Any]]:
-    """
-    Gọi lịch đa giải của đội trên ESPN (/soccer/all/teams/{id}/schedule)
-    để bắt trọn VĐQG & Cúp QG của cả đội ngoài Top 5 châu Âu.
-    """
-    if not team_id:
-        return []
-    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/teams/{team_id}/schedule"
-    data = _http_get_json(url, params={"season": season})
+def _parse_schedule_events(data: dict[str, Any], team_id: str) -> list[dict[str, Any]]:
     events = data.get("events", []) or []
     parsed: list[dict[str, Any]] = []
 
@@ -1009,7 +1044,39 @@ def get_team_all_comp_schedule(team_id: str, season: int = SEASON_YEAR) -> list[
                 "result": result_char,
             }
         )
+    return parsed
 
+
+def get_team_all_comp_schedule(
+    team_id: str,
+    season: int = SEASON_YEAR,
+    include_fixtures: bool = True,
+) -> list[dict[str, Any]]:
+    """
+    Gọi lịch đa giải của đội trên ESPN (/soccer/all/teams/{id}/schedule):
+    kết hợp cả kết quả đã đá lẫn tham số fixture=true cho các trận sắp đá.
+    """
+    if not team_id:
+        return []
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/teams/{team_id}/schedule"
+
+    merged: dict[str, dict[str, Any]] = {}
+    if include_fixtures:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_past = pool.submit(_http_get_json, url, {"season": season})
+            f_next = pool.submit(_http_get_json, url, {"season": season, "fixture": "true"})
+            for fut in (f_past, f_next):
+                try:
+                    for item in _parse_schedule_events(fut.result(timeout=8), team_id):
+                        merged[item["event_id"]] = item
+                except Exception:
+                    pass
+    else:
+        data = _http_get_json(url, params={"season": season})
+        for item in _parse_schedule_events(data, team_id):
+            merged[item["event_id"]] = item
+
+    parsed = list(merged.values())
     parsed.sort(key=lambda x: x["date_utc"] or "")
     return parsed
 
@@ -1131,7 +1198,7 @@ def extract_h2h_with_fallback(
     all_past_events = list(home_schedule_curr)
     past_seasons = [SEASON_YEAR - 1, SEASON_YEAR - 2, SEASON_YEAR - 3]
     with ThreadPoolExecutor(max_workers=3) as pool:
-        futs = [pool.submit(get_team_all_comp_schedule, home_id, yr) for yr in past_seasons]
+        futs = [pool.submit(get_team_all_comp_schedule, home_id, yr, False) for yr in past_seasons]
         try:
             for fut in as_completed(futs, timeout=8):
                 try:
@@ -1549,8 +1616,8 @@ def analyze_match(
         f_standings = pool.submit(get_league_standings, league_code)
         f_h_roster = pool.submit(get_team_roster_4_lines, slug, home_id)
         f_a_roster = pool.submit(get_team_roster_4_lines, slug, away_id)
-        f_h_sched = pool.submit(get_team_all_comp_schedule, home_id, SEASON_YEAR)
-        f_a_sched = pool.submit(get_team_all_comp_schedule, away_id, SEASON_YEAR)
+        f_h_sched = pool.submit(get_team_all_comp_schedule, home_id, SEASON_YEAR, True)
+        f_a_sched = pool.submit(get_team_all_comp_schedule, away_id, SEASON_YEAR, True)
         f_rss = (
             pool.submit(fetch_uefa_rss_news, fixture["home_name"], fixture["away_name"], league_code, 8)
             if include_rss
