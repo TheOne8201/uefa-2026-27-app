@@ -57,6 +57,7 @@ TRUSTED_RSS_DOMAINS = [
 TEAM_ALIASES: dict[str, str] = {
     "real": "real madrid",
     "rm": "real madrid",
+    "real madrid": "real madrid",
     "barca": "barcelona",
     "fcb": "barcelona",
     "atleti": "atletico madrid",
@@ -67,6 +68,7 @@ TEAM_ALIASES: dict[str, str] = {
     "betis": "real betis",
     "villarreal": "villarreal",
     "inter": "inter milan",
+    "internazionale": "inter milan",
     "milan": "ac milan",
     "ac milan": "ac milan",
     "juve": "juventus",
@@ -77,6 +79,7 @@ TEAM_ALIASES: dict[str, str] = {
     "bologna": "bologna",
     "fiorentina": "fiorentina",
     "bayern": "bayern munich",
+    "bayern munchen": "bayern munich",
     "dortmund": "borussia dortmund",
     "bvb": "borussia dortmund",
     "leverkusen": "bayer leverkusen",
@@ -426,72 +429,161 @@ def get_league_teams(league_code: str) -> list[dict[str, str]]:
     return sorted(teams_map.values(), key=lambda x: x["name"])
 
 
+def _schedule_item_to_fixture(m: dict[str, Any], league_code: str) -> dict[str, Any]:
+    """Chuyển đổi bản ghi lịch đội bóng thành chuẩn fixture của Web App & Telegram Bot."""
+    league_info = LEAGUES[league_code]
+    dt_vn = m.get("dt_vn") or parse_iso_to_vn(m.get("date_utc", ""))
+    time_label = dt_vn.strftime("%d/%m %H:%M") if dt_vn else "TBD"
+    h_score = m.get("home_score")
+    a_score = m.get("away_score")
+    state = m.get("state", "pre")
+    score_tag = (
+        f" [{h_score}-{a_score}]"
+        if state in ("in", "post") and h_score is not None and a_score is not None
+        else ""
+    )
+
+    # Thử lấy thêm thông tin sân vận động & vòng đấu từ scoreboard đúng ngày diễn ra trận
+    venue_str = "Sân CLB chủ nhà"
+    round_name = league_info["short"]
+    if dt_vn:
+        day_str = dt_vn.astimezone(timezone.utc).strftime("%Y%m%d")
+        sb_url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_info['slug']}/scoreboard"
+        sb_data = _http_get_json(sb_url, params={"dates": day_str, "limit": 50})
+        for fx in _parse_scoreboard_events(sb_data, league_code):
+            if fx["event_id"] == m["event_id"]:
+                return fx
+
+    return {
+        "event_id": m["event_id"],
+        "league_code": league_code,
+        "league_name": league_info["name"],
+        "slug": league_info["slug"],
+        "date_utc": m.get("date_utc", ""),
+        "kickoff_vn": fmt_vn_time(dt_vn),
+        "kickoff_dt_vn": dt_vn,
+        "status_state": state,
+        "status_detail": state.upper(),
+        "round_name": round_name,
+        "venue": venue_str,
+        "home_id": m.get("home_id", ""),
+        "home_name": m.get("home_name", ""),
+        "home_abbr": "",
+        "home_logo": "",
+        "away_id": m.get("away_id", ""),
+        "away_name": m.get("away_name", ""),
+        "away_abbr": "",
+        "away_logo": "",
+        "home_score": h_score,
+        "away_score": a_score,
+        "display_label": (
+            f"{time_label} | {m.get('home_name', '')} vs {m.get('away_name', '')}{score_tag}"
+        ),
+    }
+
+
 def find_team_next_match(
     query_text: str,
     preferred_league: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Tìm trận đấu sắp tới (ưu tiên chưa đá/đang đá, nếu không có thì lấy trận gần nhất)
-    của 1 đội bóng trên UCL & UEL (tự nhận diện giải đấu).
+    của 1 đội bóng bằng cách tra ID đội trong 36 đội UCL/UEL rồi lấy lịch riêng của đội đó.
     """
     resolved = resolve_team_alias(query_text)
     raw_norm = normalize_text(query_text)
-    if not resolved:
+    if not resolved and not raw_norm:
         return None
 
     target_leagues = [preferred_league] if preferred_league in LEAGUES else ["UCL", "UEL"]
-    all_fixtures: list[dict[str, Any]] = []
 
+    # 1. Lấy danh sách đội của UCL & UEL song song để tìm chính xác team_id
+    teams_by_league: dict[str, list[dict[str, str]]] = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futs = {
-            pool.submit(get_upcoming_fixtures, lg, 45, 14): lg
-            for lg in target_leagues
-        }
-        for fut in as_completed(futs, timeout=12):
+        futs = {pool.submit(get_league_teams, lg): lg for lg in target_leagues}
+        for fut in as_completed(futs, timeout=10):
+            lg = futs[fut]
             try:
-                all_fixtures.extend(fut.result())
+                teams_by_league[lg] = fut.result()
+            except Exception:
+                teams_by_league[lg] = []
+
+    def _score_team(team_obj: dict[str, str]) -> int:
+        tn = normalize_text(team_obj.get("name", ""))
+        ta = normalize_text(team_obj.get("abbr", ""))
+        best = 0
+        if resolved:
+            if resolved == tn:
+                best = max(best, 100)
+            elif resolved in tn:
+                best = max(best, 90)
+            elif resolved == ta:
+                best = max(best, 80)
+            elif all(tok in tn for tok in resolved.split()):
+                best = max(best, 75)
+        if raw_norm:
+            if raw_norm == tn:
+                best = max(best, 95)
+            elif raw_norm in tn:
+                best = max(best, 82)
+            elif raw_norm == ta:
+                best = max(best, 78)
+        return best
+
+    matched_teams: list[tuple[int, str, dict[str, str]]] = []
+    for lg, t_list in teams_by_league.items():
+        for t in t_list:
+            sc = _score_team(t)
+            if sc > 0:
+                matched_teams.append((sc, lg, t))
+
+    matched_teams.sort(key=lambda x: -x[0])
+
+    # 2. Kéo lịch thi đấu riêng của đội khớp nhất & lọc đúng giải UCL/UEL
+    for _, lg, team_obj in matched_teams[:2]:
+        team_id = team_obj["id"]
+        target_slug = LEAGUES[lg]["slug"]
+        target_kw = "champions league" if lg == "UCL" else "europa league"
+        sched = get_team_all_comp_schedule(team_id, SEASON_YEAR)
+
+        uefa_matches = [
+            m
+            for m in sched
+            if m.get("league_slug") == target_slug
+            or target_kw in m.get("league_name", "").lower()
+        ]
+        if not uefa_matches:
+            continue
+
+        upcoming = [m for m in uefa_matches if m["state"] in ("pre", "in")]
+        if upcoming:
+            upcoming.sort(key=lambda x: x["date_utc"] or "9999")
+            return _schedule_item_to_fixture(upcoming[0], lg)
+
+        completed = [m for m in uefa_matches if m["state"] == "post"]
+        if completed:
+            completed.sort(key=lambda x: x["date_utc"] or "", reverse=True)
+            return _schedule_item_to_fixture(completed[0], lg)
+
+    # 3. Dự phòng cuối cùng: quét scoreboard gần hiện tại nếu đội không nằm trong danh sách teams
+    fallback_fixtures: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(get_upcoming_fixtures, lg, 21, 7) for lg in target_leagues]
+        for fut in as_completed(futs, timeout=10):
+            try:
+                fallback_fixtures.extend(fut.result())
             except Exception:
                 pass
 
-    def _match_score(fx: dict[str, Any]) -> int:
+    for fx in fallback_fixtures:
         hn = normalize_text(fx["home_name"])
         an = normalize_text(fx["away_name"])
-        ha = normalize_text(fx["home_abbr"])
-        aa = normalize_text(fx["away_abbr"])
-        score = 0
-        for q in (resolved, raw_norm):
-            if not q:
-                continue
-            if q == hn or q == an:
-                score = max(score, 100)
-            elif q in hn or q in an:
-                score = max(score, 80)
-            elif q == ha or q == aa:
-                score = max(score, 70)
-            elif all(tok in hn for tok in q.split()) or all(tok in an for tok in q.split()):
-                score = max(score, 65)
-        return score
+        if (resolved and (resolved in hn or resolved in an)) or (
+            raw_norm and (raw_norm in hn or raw_norm in an)
+        ):
+            return fx
 
-    scored = [(s, fx) for fx in all_fixtures if (s := _match_score(fx)) > 0]
-    if not scored:
-        return None
-
-    # Ưu tiên trận chưa đá / đang đá sớm nhất, sau đó mới tới trận đã đá gần nhất
-    upcoming = [item for item in scored if item[1]["status_state"] in ("pre", "in")]
-    if upcoming:
-        upcoming.sort(key=lambda x: (-x[0], x[1]["date_utc"] or "9999"))
-        return upcoming[0][1]
-
-    completed = [item for item in scored if item[1]["status_state"] == "post"]
-    if completed:
-        completed.sort(key=lambda x: (-x[0], x[1]["date_utc"] or ""), reverse=False)
-        # Lấy điểm khớp cao nhất, ngày gần nhất
-        best_score = max(x[0] for x in completed)
-        best_group = [x[1] for x in completed if x[0] == best_score]
-        best_group.sort(key=lambda x: x["date_utc"] or "", reverse=True)
-        return best_group[0]
-
-    return scored[0][1]
+    return None
 
 
 # ==============================================================================
@@ -510,10 +602,9 @@ def _classify_uefa_zone(rank: int) -> str:
 def get_league_standings(league_code: str) -> dict[str, Any]:
     """Lấy bảng xếp hạng League Phase 36 đội từ ESPN Standings."""
     slug = LEAGUES[league_code]["slug"]
-    url = f"https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings"
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/standings"
     data = _http_get_json(url, params={"season": SEASON_YEAR})
     if not data or not (data.get("children") or data.get("standings")):
-        # Thử không truyền season nếu ESPN tự trỏ mùa hiện hành
         data = _http_get_json(url)
 
     entries: list[dict[str, Any]] = []
@@ -643,7 +734,6 @@ def get_team_roster_4_lines(slug: str, team_id: str) -> dict[str, Any]:
     data = _http_get_json(url_league)
     athletes_raw = data.get("athletes", []) or []
 
-    # Nếu endpoint theo giải Cúp chưa đủ cầu thủ, thử endpoint đa giải
     if not athletes_raw:
         url_all = f"https://site.api.espn.com/apis/site/v2/sports/soccer/all/teams/{team_id}/roster"
         data = _http_get_json(url_all)
@@ -687,7 +777,6 @@ def get_team_roster_4_lines(slug: str, team_id: str) -> dict[str, Any]:
         else:
             line_key = "Tiền đạo"
 
-        # Trích số liệu thật (trận, bàn, kiến tạo) từ statistics.splits.categories
         apps = 0
         goals = 0
         assists = 0
@@ -717,7 +806,6 @@ def get_team_roster_4_lines(slug: str, team_id: str) -> dict[str, Any]:
             }
         )
 
-    # Sắp xếp ưu tiên cầu thủ đá nhiều + đóng góp bàn thắng/kiến tạo cao
     for k in lines:
         lines[k].sort(
             key=lambda x: (x["appearances"], x["goals"] * 2 + x["assists"]),
@@ -818,7 +906,6 @@ def extract_injuries_filtered(
             return_date = str(details.get("returnDate") or "").strip()
             comment = str(inj.get("shortComment") or inj.get("longComment") or "").strip()
 
-            # Lọc cầu thủ đã chuyển nhượng/cho mượn dựa trên trạng thái hoặc đội hình hiện hành
             low_check = f"{status} {detail_type} {comment}".lower()
             if any(k in low_check for k in ("loaned", "transferred", "departed", "sold")):
                 continue
@@ -952,11 +1039,11 @@ def build_sandwich_schedule(
         delta_hours = (m["dt_vn"] - target_dt_vn).total_seconds() / 3600.0
         delta_days = round(abs(delta_hours) / 24.0, 1)
 
-        if -180 <= delta_hours < -6:  # Trong vòng ~7.5 ngày trước trận
+        if -180 <= delta_hours < -6:
             item = dict(m)
             item["gap_days"] = delta_days
             before.append(item)
-        elif 6 < delta_hours <= 180:  # Trong vòng ~7.5 ngày sau trận
+        elif 6 < delta_hours <= 180:
             item = dict(m)
             item["gap_days"] = delta_days
             after.append(item)
@@ -1014,7 +1101,6 @@ def extract_h2h_with_fallback(
     h2h_list: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
 
-    # 1. Thử đọc trực tiếp từ ESPN Summary
     for block in summary.get("headToHeadGames", []) or []:
         for ev in block.get("events", []) or []:
             ev_id = str(ev.get("id", "")).strip()
@@ -1042,7 +1128,6 @@ def extract_h2h_with_fallback(
         h2h_list.sort(key=lambda x: x["date_utc"], reverse=True)
         return h2h_list[:5]
 
-    # 2. Vá lỗi trống H2H: quét lịch sử đa giải của đội chủ nhà trong 4 mùa gần nhất
     all_past_events = list(home_schedule_curr)
     past_seasons = [SEASON_YEAR - 1, SEASON_YEAR - 2, SEASON_YEAR - 3]
     with ThreadPoolExecutor(max_workers=3) as pool:
@@ -1164,7 +1249,6 @@ def _fetch_single_boxscore_stats(match_item: dict[str, Any], team_id: str) -> di
     ev_id = match_item.get("event_id")
     if not ev_id:
         return None
-    # Gọi summary theo đúng slug giải đấu (nếu thiếu slug thì dùng uefa.champions/all)
     api_slug = slug if "." in slug else "all"
     url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{api_slug}/summary"
     data = _http_get_json(url, params={"event": ev_id})
@@ -1211,7 +1295,6 @@ def _fetch_single_boxscore_stats(match_item: dict[str, Any], team_id: str) -> di
         desc_text = str(ke.get("text", ""))
         cat = _classify_goal_event(type_text, desc_text)
 
-        # Lưu ý: với Own Goal trên ESPN, team.id đôi khi là đội được hưởng bàn thắng
         if ke_team_id == team_id:
             goals_for_types[cat] += 1
         elif ke_team_id:
@@ -1420,7 +1503,6 @@ def fetch_uefa_rss_news(
         except Exception:
             pass
 
-    # Lọc trùng theo tiêu đề chuẩn hóa & giữ bài mới nhất (trong 14 ngày gần đây nếu đủ bài)
     dedup: list[dict[str, Any]] = []
     seen_titles: set[str] = set()
     collected.sort(key=lambda x: x["published_ts"], reverse=True)
@@ -1462,7 +1544,6 @@ def analyze_match(
 
     url_summary = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/summary"
 
-    # Đợt 1: kéo song song Summary, Standings, 2 Roster, 2 Lịch đa giải, và Google News RSS
     with ThreadPoolExecutor(max_workers=7) as pool:
         f_summary = pool.submit(_http_get_json, url_summary, {"event": event_id})
         f_standings = pool.submit(get_league_standings, league_code)
@@ -1506,7 +1587,6 @@ def analyze_match(
             except Exception:
                 pass
 
-    # Đợt 2: xử lý T-75, chấn thương đã lọc, Knock-out, Bánh mì kẹp, Phong độ
     lineups = extract_lineups_t75(summary, home_id, away_id)
     injuries = extract_injuries_filtered(summary, home_id, away_id, home_roster, away_roster)
     knockout = extract_knockout_context(summary, fixture)
@@ -1518,7 +1598,6 @@ def analyze_match(
     home_form = compute_team_form(home_sched, target_dt_vn)
     away_form = compute_team_form(away_sched, target_dt_vn)
 
-    # Đợt 3: chạy song song H2H (có vá 4 mùa) và Boxscore + KeyEvents nâng cao
     h2h: list[dict[str, Any]] = []
     boxscore_metrics: dict[str, Any] = {
         "home": {"overall": _aggregate_boxscores([]), "home_split": _aggregate_boxscores([]), "away_split": _aggregate_boxscores([])},
@@ -1542,7 +1621,6 @@ def analyze_match(
         except Exception:
             pass
 
-    # Tìm hàng BXH của 2 đội
     home_standing = next((r for r in standings.get("table", []) if r["team_id"] == home_id), None)
     away_standing = next((r for r in standings.get("table", []) if r["team_id"] == away_id), None)
 
